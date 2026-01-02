@@ -1,0 +1,542 @@
+/*
+ * CODE B (FINAL FIX):
+ * - Telegram: IMMEDIATE start, sends every 2 seconds.
+ * - Buzzer: IMMEDIATE start, plays sound -> waits 3 seconds -> plays sound.
+ * - Non-blocking: Telegram keeps working during the 3-second buzzer silence.
+ */
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include "esp_camera.h"
+#include <Preferences.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+Preferences preferences;
+String ssid = "";
+String password = "";
+String botToken = "";
+String chatID = "";
+
+// --- PINS ---
+const int PIN_MQ2_A0    = 14; 
+const int PIN_FLAME_A0  = 3;
+const int PIN_LED_RED   = 45;
+const int PIN_LED_GREEN = 46;
+const int PIN_BUZZER    = 47;
+const int PIN_BOOT_BTN  = 0;
+const int PIN_UNUSED_D0 = 21;
+
+// --- THRESHOLDS ---
+int SMOKE_THRESHOLD = 1000;
+int FLAME_THRESHOLD = 150;
+
+// --- TIMING ---
+const uint32_t SENSOR_INTERVAL_MS = 200;
+uint32_t lastSensorRead = 0;
+
+const uint32_t TELE_COOLDOWN_MS = 15000; // Telegram every 15 seconds
+uint32_t lastTeleTime = 0;
+
+const uint32_t BUZZER_INTERVAL_MS = 3000; // 3 Seconds silence between beeps
+uint32_t lastBuzzerTime = 0;
+
+const uint32_t BLE_NOTIFY_MS = 250;
+uint32_t lastBleNotify = 0;
+
+// --- ALARM STATE ---
+bool alarmActive = false;
+
+// --- CAMERA PINS ---
+#define PWDN_GPIO_NUM -1
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 15
+#define SIOD_GPIO_NUM 4
+#define SIOC_GPIO_NUM 5
+#define Y9_GPIO_NUM 16
+#define Y8_GPIO_NUM 17
+#define Y7_GPIO_NUM 18
+#define Y6_GPIO_NUM 12
+#define Y5_GPIO_NUM 10
+#define Y4_GPIO_NUM 8
+#define Y3_GPIO_NUM 9
+#define Y2_GPIO_NUM 11
+#define VSYNC_GPIO_NUM 6
+#define HREF_GPIO_NUM 7
+#define PCLK_GPIO_NUM 13
+
+// --- BLE UUIDs ---
+#define SERVICE_UUID       "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHAR_SSID_UUID     "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define CHAR_PASS_UUID     "889e2486-2598-444f-954f-173627096756"
+#define CHAR_TOKEN_UUID    "12345678-1234-1234-1234-1234567890ab"
+#define CHAR_CHATID_UUID   "87654321-4321-4321-4321-ba0987654321"
+#define CHAR_SAVE_UUID     "cafebabe-cafe-cafe-cafe-cafebabecafe"
+#define CHAR_SMOKE_UUID    "cafebabe-cafe-cafe-cafe-cafebabecaf1"
+#define CHAR_FLAME_UUID    "cafebabe-cafe-cafe-cafe-cafebabecaf2"
+#define CHAR_RESULT_UUID   "cafebabe-cafe-cafe-cafe-cafebabecafd" 
+
+BLECharacteristic *pCharResult = nullptr;
+bool deviceConnected = false;
+
+// -------------------- NON-BLOCKING TELEGRAM PHOTO TASK --------------------
+TaskHandle_t tgPhotoTaskHandle = NULL;
+volatile bool tgPhotoBusy = false;
+String tgCaptionPending = "";
+
+// -------- Prototypes --------
+void startBLEServer();
+void runAlarmMode();
+void checkButtonForReset();
+int getSmoothReading(int pin);
+bool initCamera();
+bool sendTelegramPhoto(String caption);
+void silenceBuzzer();
+void playEarthquakeAlert();
+void blinkLED(int pin, int times);
+void tgPhotoTask(void *param);
+
+void notifyApp(const String &msg) {
+  if (pCharResult && deviceConnected) {
+    pCharResult->setValue(msg.c_str());
+    pCharResult->notify();
+  }
+}
+
+void notifyWifiStateNow() {
+  if (!deviceConnected) return;
+  if (ssid.length() == 0) {
+    notifyApp("WIFI_FAIL");
+    notifyApp("SSID:<none>");
+    return;
+  }
+  notifyApp("SSID:" + ssid);
+  if (WiFi.status() == WL_CONNECTED) {
+    notifyApp("WIFI_OK");
+    notifyApp("IP:" + WiFi.localIP().toString());
+  } else {
+    notifyApp("WIFI_FAIL");
+  }
+}
+
+// -------- BLE Callbacks --------
+class MyServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    deviceConnected = true;
+    Serial.println(">> App Connected");
+    notifyWifiStateNow();
+  }
+  void onDisconnect(BLEServer* pServer) override {
+    deviceConnected = false;
+    Serial.println(">> App Disconnected");
+    pServer->getAdvertising()->start();
+  }
+};
+
+class ConfigCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) override {
+    String valStr = pCharacteristic->getValue().c_str();
+    BLEUUID uuid = pCharacteristic->getUUID();
+
+    if (uuid.toString() == CHAR_SSID_UUID) {
+      preferences.putString("ssid", valStr);
+      ssid = valStr;
+      if (deviceConnected) notifyApp("SSID:" + ssid);
+
+    } else if (uuid.toString() == CHAR_PASS_UUID) {
+      preferences.putString("pass", valStr);
+      password = valStr;
+
+    } else if (uuid.toString() == CHAR_TOKEN_UUID) {
+      preferences.putString("token", valStr);
+      botToken = valStr;
+
+    } else if (uuid.toString() == CHAR_CHATID_UUID) {
+      preferences.putString("chatid", valStr);
+      chatID = valStr;
+
+    } else if (uuid.toString() == CHAR_SMOKE_UUID) {
+      SMOKE_THRESHOLD = valStr.toInt();
+      preferences.putInt("smoke", SMOKE_THRESHOLD);
+
+    } else if (uuid.toString() == CHAR_FLAME_UUID) {
+      FLAME_THRESHOLD = valStr.toInt();
+      preferences.putInt("fire", FLAME_THRESHOLD);
+
+    } else if (uuid.toString() == CHAR_SAVE_UUID && valStr == "SAVE") {
+      Serial.println("SAVE received");
+
+      if (ssid.length() == 0) {
+        notifyApp("WIFI_FAIL");
+        notifyApp("SSID:<none>");
+        return;
+      }
+
+      WiFi.mode(WIFI_STA);
+      WiFi.disconnect(true, true);
+      delay(150);
+
+      int n = WiFi.scanNetworks(false, true);
+      bool ssidFound = false;
+      for (int i = 0; i < n; i++) {
+        if (WiFi.SSID(i) == ssid) { ssidFound = true; break; }
+      }
+      WiFi.scanDelete();
+
+      if (!ssidFound) {
+        notifyApp("SSID:" + ssid);
+        notifyApp("WIFI_FAIL");
+        notifyApp("WIFI_REASON:SSID_NOT_FOUND");
+        return;
+      }
+
+      WiFi.begin(ssid.c_str(), password.c_str());
+
+      uint32_t start = millis();
+      bool ok = false;
+      while (millis() - start < 10000) {
+        if (WiFi.status() == WL_CONNECTED) { ok = true; break; }
+        delay(100);
+      }
+
+      if (ok) {
+        notifyApp("SSID:" + ssid);
+        notifyApp("WIFI_OK");
+        notifyApp("IP:" + WiFi.localIP().toString());
+      } else {
+        notifyApp("SSID:" + ssid);
+        notifyApp("WIFI_FAIL");
+        notifyApp("WIFI_REASON:WRONG_PASS_OR_TIMEOUT");
+      }
+    }
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, HIGH);
+
+  // Short beep on startup
+  #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcAttach(PIN_BUZZER, 4000, 8);
+    ledcWriteTone(PIN_BUZZER, 2000); 
+  #else
+    ledcSetup(0, 4000, 8);
+    ledcAttachPin(PIN_BUZZER, 0);
+    ledcWriteTone(0, 2000); 
+  #endif
+  delay(200); 
+  #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcWriteTone(PIN_BUZZER, 0);
+    ledcDetach(PIN_BUZZER);
+  #else
+    ledcWriteTone(0, 0);
+    ledcDetachPin(PIN_BUZZER);
+  #endif
+  digitalWrite(PIN_BUZZER, HIGH);
+  
+  preferences.begin("firealarm", false);
+
+  ssid = preferences.getString("ssid", "");
+  password = preferences.getString("pass", "");
+  botToken = preferences.getString("token", "");
+  chatID = preferences.getString("chatid", "");
+  SMOKE_THRESHOLD = preferences.getInt("smoke", SMOKE_THRESHOLD);
+  FLAME_THRESHOLD = preferences.getInt("fire", FLAME_THRESHOLD);
+
+  startBLEServer();
+  runAlarmMode();
+}
+
+void loop() {}
+
+void tgPhotoTask(void *param) {
+  tgPhotoBusy = true;
+  String cap = tgCaptionPending;
+  bool ok = sendTelegramPhoto(cap);
+  Serial.println(ok ? "✅ Photo Sent" : "❌ Photo Failed");
+  tgPhotoBusy = false;
+  tgPhotoTaskHandle = NULL;
+  vTaskDelete(NULL);
+}
+
+void startBLEServer() {
+  BLEDevice::init("FireAlarm_Setup");
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  BLECharacteristic *pCharSSID  = pService->createCharacteristic(CHAR_SSID_UUID,  BLECharacteristic::PROPERTY_WRITE);
+  BLECharacteristic *pCharPass  = pService->createCharacteristic(CHAR_PASS_UUID,  BLECharacteristic::PROPERTY_WRITE);
+  BLECharacteristic *pCharToken = pService->createCharacteristic(CHAR_TOKEN_UUID, BLECharacteristic::PROPERTY_WRITE);
+  BLECharacteristic *pCharChat  = pService->createCharacteristic(CHAR_CHATID_UUID,BLECharacteristic::PROPERTY_WRITE);
+  BLECharacteristic *pCharSave  = pService->createCharacteristic(CHAR_SAVE_UUID,  BLECharacteristic::PROPERTY_WRITE);
+  BLECharacteristic *pCharSmoke = pService->createCharacteristic(CHAR_SMOKE_UUID, BLECharacteristic::PROPERTY_WRITE);
+  BLECharacteristic *pCharFire  = pService->createCharacteristic(CHAR_FLAME_UUID, BLECharacteristic::PROPERTY_WRITE);
+
+  pCharResult = pService->createCharacteristic(CHAR_RESULT_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  pCharResult->addDescriptor(new BLE2902());
+
+  ConfigCallbacks *cb = new ConfigCallbacks();
+  pCharSSID->setCallbacks(cb);
+  pCharPass->setCallbacks(cb);
+  pCharToken->setCallbacks(cb);
+  pCharChat->setCallbacks(cb);
+  pCharSave->setCallbacks(cb);
+  pCharSmoke->setCallbacks(cb);
+  pCharFire->setCallbacks(cb);
+
+  pService->start();
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  adv->setScanResponse(true);
+  BLEDevice::startAdvertising();
+  Serial.println("BLE server started.");
+}
+
+void runAlarmMode() {
+  Serial.println("--- ALARM MODE ---");
+  initCamera();
+
+  WiFi.mode(WIFI_STA);
+  if (ssid.length() > 0) {
+    WiFi.begin(ssid.c_str(), password.c_str());
+    int tries = 0;
+    while (WiFi.status() != WL_CONNECTED && tries < 20) {
+      delay(500);
+      tries++;
+      checkButtonForReset();
+    }
+  }
+
+  notifyWifiStateNow();
+  wl_status_t lastWiFi = WiFi.status();
+  uint32_t lastWifiPoll = millis();
+
+  pinMode(PIN_MQ2_A0, INPUT);
+  pinMode(PIN_FLAME_A0, INPUT);
+  pinMode(PIN_UNUSED_D0, INPUT_PULLDOWN);
+
+  while (true) {
+    checkButtonForReset();
+
+    if (millis() - lastWifiPoll >= 1000) {
+      lastWifiPoll = millis();
+      wl_status_t now = WiFi.status();
+      if (now != lastWiFi) {
+        lastWiFi = now;
+        notifyWifiStateNow();
+      }
+    }
+
+    if (millis() - lastSensorRead >= SENSOR_INTERVAL_MS) {
+      lastSensorRead = millis();
+
+      int smoke = getSmoothReading(PIN_MQ2_A0);
+      int fire  = getSmoothReading(PIN_FLAME_A0);
+
+      // LIVE Monitor
+      if (pCharResult && deviceConnected && (millis() - lastBleNotify >= BLE_NOTIFY_MS)) {
+        lastBleNotify = millis();
+        String data = "LIVE:" + String(smoke) + ":" + String(fire);
+        pCharResult->setValue(data.c_str());
+        pCharResult->notify();
+      }
+
+      // ----------------- ALARM LOGIC -----------------
+      if (smoke > SMOKE_THRESHOLD || fire < FLAME_THRESHOLD) {
+        
+        alarmActive = true;
+        digitalWrite(PIN_LED_RED, HIGH);
+        digitalWrite(PIN_LED_GREEN, LOW);
+
+        // 1. TELEGRAM (Sends every 2 seconds, no blocking)
+        if (WiFi.status() == WL_CONNECTED &&
+            (millis() - lastTeleTime > TELE_COOLDOWN_MS) &&
+            !tgPhotoBusy) {
+
+          String alertMsg = "";
+          if (smoke > SMOKE_THRESHOLD) alertMsg += "💨 SMOKE DETECTED! ";
+          if (fire < FLAME_THRESHOLD)  alertMsg += "🔥 FLAME DETECTED! ";
+
+          tgCaptionPending = "🚨 ALARM: " + alertMsg +
+                             "\nSmoke: " + String(smoke) +
+                             "\nFire: " + String(fire);
+
+          xTaskCreatePinnedToCore(
+            tgPhotoTask, "tgPhotoTask", 12288, NULL, 1, &tgPhotoTaskHandle, 0
+          );
+          lastTeleTime = millis();
+          Serial.println("🚀 Telegram Sent.");
+        }
+
+        // 2. BUZZER (Plays sound, then waits 3 seconds before playing again)
+        // Uses millis() so it DOES NOT BLOCK Telegram
+        if (millis() - lastBuzzerTime > BUZZER_INTERVAL_MS) {
+           playEarthquakeAlert(); // Plays short beep-boop (~500ms)
+           lastBuzzerTime = millis(); // Reset timer to wait another 3 seconds
+        }
+
+      } else {
+        // --- NO FIRE ---
+        if (alarmActive) {
+           alarmActive = false;
+        }
+        digitalWrite(PIN_LED_RED, LOW);
+        digitalWrite(PIN_LED_GREEN, HIGH);
+        silenceBuzzer();
+        
+        // Reset buzzer timer so it's ready for next time
+        lastBuzzerTime = 0; 
+      }
+    }
+    delay(50);
+  }
+}
+
+// -------------------- Helpers --------------------
+void checkButtonForReset() {
+  if (digitalRead(PIN_BOOT_BTN) == LOW) {
+    uint32_t pressStart = millis();
+    while (digitalRead(PIN_BOOT_BTN) == LOW) {
+      if (millis() - pressStart > 3000) {
+        Serial.println("🔄 Resetting WiFi...");
+        silenceBuzzer();
+        WiFi.disconnect(true, true);
+        preferences.putString("ssid", "");
+        preferences.putString("pass", "");
+        ssid = "";
+        password = "";
+        notifyWifiStateNow();
+        delay(200);
+        ESP.restart();
+      }
+      delay(10);
+    }
+  }
+}
+
+int getSmoothReading(int pin) {
+  long total = 0;
+  for (int i = 0; i < 5; i++) {
+    total += analogRead(pin);
+    delay(2);
+  }
+  return total / 5;
+}
+
+void blinkLED(int pin, int times) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(pin, HIGH); delay(120);
+    digitalWrite(pin, LOW);  delay(120);
+  }
+}
+
+void silenceBuzzer() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWriteTone(PIN_BUZZER, 0);
+  ledcDetach(PIN_BUZZER);
+#else
+  ledcWriteTone(0, 0);
+#endif
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, HIGH);
+}
+
+void playEarthquakeAlert() {
+  // This takes about 500ms to play. 
+  // It is short enough that it won't break Telegram.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  if (ledcRead(PIN_BUZZER) == 0) ledcAttach(PIN_BUZZER, 4000, 8);
+  uint32_t start = millis();
+  while (millis() - start < 500) {
+    ledcWriteTone(PIN_BUZZER, 960); delay(50);
+    ledcWriteTone(PIN_BUZZER, 770); delay(50);
+  }
+#else
+  uint32_t start = millis();
+  while (millis() - start < 500) {
+    ledcWriteTone(0, 960); delay(50);
+    ledcWriteTone(0, 770); delay(50);
+  }
+#endif
+  silenceBuzzer();
+}
+
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM; config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM; config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.frame_size = FRAMESIZE_VGA;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 15;
+  config.fb_count = 1;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) return false;
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (s && s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);
+    s->set_hmirror(s, 1);
+  }
+  return true;
+}
+
+bool sendTelegramPhoto(String caption) {
+  if (botToken == "" || chatID == "") return false;
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return false;
+  WiFiClientSecure client;
+  client.setInsecure();
+  if (!client.connect("api.telegram.org", 443)) {
+    esp_camera_fb_return(fb);
+    return false;
+  }
+  String boundary = "------------------------eb5851722e576820";
+  String head = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n" + chatID + "\r\n"
+                "--" + boundary + "\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n" + caption + "\r\n"
+                "--" + boundary + "\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"esp32.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+  String tail = "\r\n--" + boundary + "--\r\n";
+  uint32_t totalLen = head.length() + fb->len + tail.length();
+  client.println("POST /bot" + botToken + "/sendPhoto HTTP/1.1");
+  client.println("Host: api.telegram.org");
+  client.println("Content-Length: " + String(totalLen));
+  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  client.println();
+  client.print(head);
+  uint8_t *buf = fb->buf;
+  size_t len = fb->len;
+  for (size_t n = 0; n < len; n += 1024) {
+    size_t chunk = (n + 1024 < len) ? 1024 : (len - n);
+    client.write(buf + n, chunk);
+  }
+  client.print(tail);
+  esp_camera_fb_return(fb);
+  uint32_t startWait = millis();
+  while (client.connected() && millis() - startWait < 3000) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+  client.stop();
+  return true;
+}
+
